@@ -76,48 +76,184 @@ func bytesToUUID(data []byte) (ret uuid.UUID) {
 	return
 }
 
-// User is the structure definition for a user record.
+
+
+type FileMetadata struct
+{
+	CryptKey []byte
+	MACKey []byte
+	Location UUID
+}
+
+
+
+// Use= is the structure definition for a user record.
 type User struct {
 	Username string
+	Namespace map[[]byte]FileMetadata
 
 	// You can add other fields here if you want...
 	// Note for JSON to marshal/unmarshal, the fields need to
 	// be public (start with a capital letter)
 }
 
+
+
+
+
 // InitUser will be called a single time to initialize a new user.
 func InitUser(username string, password string) (userdataptr *User, err error) {
-	var userdata User
-	userdataptr = &userdata
 
-	//TODO: This is a toy implementation.
-	userdata.Username = username
-	//End of toy implementation
+
+	cryptKey := userlib.Argon2Key(password,username,16)
+	
+
+
+	MacKey := userlib.HashKDF(cryptKey,[]byte("mac for user's personal user struct"))
+	MacKey=MacKey[:16]
+
+
+
+	var pk_encrypt_key userlib.PKEEncKey
+	var sk_decrypt_key userlib.PKEDecKey
+	pk_encrypt_key, sk_decrypt_key, _ = userlib.PKEKeyGen()
+
+
+
+
+	var pk_verify_key userlib.DSVerifyKey
+	var sk_sign_key userlib.DSSignKey
+	pk_verify_key, sk_sign_key, _ = userlib.DSKeyGen()
+
+	
+
+
+	KeystoreSet(username+"_verify_key",pk_verify_key)
+	KeystoreSet(username+"_encrypt_key",pk_encrypt_key)
+	
+
+
+
+	var userdata User 
+	userdataptr = &userdata
+	userdata.Username := username
+	userdata.Namespace:= make(map[[]byte]FileMetadata)
+	userdata.secretSignKey:=sk_sign_key
+	userdata.secretDecryptKey:=sk_decrypt_key
+
+
+	userStructByteArray:=json.Marshal(userdata)
+
+
+
+
+	encryptedThenMACedStruct=encryptThenMAC(userStructByteArray,cryptKey,MacKey)
+
+
+	usernameHashBytes:=Hash(username)[:16]
+	structLocation:=uuid.FromBytes(usernameHashBytes)
+
+
+	userlib.DatastoreSet(structLocation,encryptedThenMACedStruct)
+
+
+
 
 	return &userdata, nil
 }
 
+
+
+
+
+
 // GetUser is documented at:
 // https://cs161.org/assets/projects/2/docs/client_api/getuser.html
 func GetUser(username string, password string) (userdataptr *User, err error) {
-	var userdata User
+	
+	cryptKey := userlib.Argon2Key(password,username,16)
+
+
+	MacKey := userlib.HashKDF(cryptKey,[]byte("mac for user's personal user struct"))
+	MacKey=MacKey[:16]
+
+
+	usernameHashBytes:=userlib.Hash([]byte(username))[:16]
+	structLocation:=uuid.FromBytes(usernameHashBytes)
+	
+	encryptedThenMACedStruct:=userlib.DatastoreGet(structLocation)
+	byteArrayUserData=checkMACandDecrypt(encryptedThenMACedStruct,cryptKey,MacKey)  
+	var userdata User := json.Unmarshal(byteArrayUserData)
 	userdataptr = &userdata
+
 
 	return userdataptr, nil
 }
+
+
+
+
+
 
 // StoreFile is documented at:
 // https://cs161.org/assets/projects/2/docs/client_api/storefile.html
 func (userdata *User) StoreFile(filename string, data []byte) (err error) {
 
-	//TODO: This is a toy implementation.
-	storageKey, _ := uuid.FromBytes([]byte(filename + userdata.Username)[:16])
+	fileNameHashed:=userlib.Hash([]byte(filename))
+	
+
+	newCryptKey=userlib.RandomBytes(16)
+	newMACKey=userlib.RandomBytes(16)
+	newFileLoc=uuid.New()
+
+	userdata.Namespace[fileNameHashed]=FileMetadata{CryptKey:newCryptKey,MacKey:newMACKey, UUID:newFileLoc}
+
 	jsonData, _ := json.Marshal(data)
-	userlib.DatastoreSet(storageKey, jsonData)
+	
+	encryptedThenMACedData:= encryptThenMAC(newCryptKey,newMACKey,jsonData)
+
+
+	userlib.DatastoreSet(userdata.Namespace[fileNameHashed].UUID, encryptedThenMACedData)
 	//End of toy implementation
 
 	return
 }
+
+
+func encryptThenMAC(byte[] cryptKey, byte[] MACKey, byte[] data)
+{
+	IV:= userlib.RandomBytes(16)
+	encryptedData:= userlib.SymEnc(cryptKey,IV,data)
+	encryptedThenMACedData:= HMACEval(MACKey,encryptedData)+encryptedData
+	return encryptedThenMACedData
+} 
+
+func checkMACandDecrypt(byte[] cryptKey, byte[] MACkey, byte[] encryptedThenMACedData)
+{
+	
+	actualMAC:=encryptedThenMACedData[:16]
+	encryptedData:=encryptedThenMACedData[16:]
+
+	matchingMACs :=HMACEqual(  actualMAC,  userlib.HMACEval(encryptedData)  )
+
+	if !matchingMACs {
+		return nil, errors.New(strings.ToTitle("MAC error"))
+	}
+
+	return SymDec(cryptKey,encryptedStruct)
+}
+
+func encryptThenSign()
+{
+
+}
+
+func checkSigAndDecrypt()
+{
+
+}
+
+
 
 // AppendFile is documented at:
 // https://cs161.org/assets/projects/2/docs/client_api/appendfile.html
@@ -129,24 +265,37 @@ func (userdata *User) AppendFile(filename string, data []byte) (err error) {
 // https://cs161.org/assets/projects/2/docs/client_api/loadfile.html
 func (userdata *User) LoadFile(filename string) (dataBytes []byte, err error) {
 
-	//TODO: This is a toy implementation.
-	storageKey, _ := uuid.FromBytes([]byte(filename + userdata.Username)[:16])
-	dataJSON, ok := userlib.DatastoreGet(storageKey)
+
+	fileNameHashed:=userlib.Hash([]byte(filename))
+	fileMetadataStruct:= userdata.Namespace[fileNameHashed]
+	fileLoc=fileMetadataStruct.Location
+	fileDecryptKey=fileMetadataStruct.CryptKey
+	fileMACKey=fileMetadataStruct.MACKey
+
+	
+
+	encryptedThenMACedFile:=userlib.DatastoreGet(fileLoc)
+	
+
+
+	
+	dataJSON, ok := checkMACandDecrypt(encryptedThenMACedFile,fileDecryptKey,FileMacKey) 
+
 	if !ok {
 		return nil, errors.New(strings.ToTitle("File not found!"))
 	}
 	json.Unmarshal(dataJSON, &dataBytes)
 	return dataBytes, nil
-	//End of toy implementation
+	
 
-	return
+	
 }
 
 // ShareFile is documented at:
 // https://cs161.org/assets/projects/2/docs/client_api/sharefile.html
 func (userdata *User) ShareFile(filename string, recipient string) (
 	accessToken uuid.UUID, err error) {
-
+	userlib.KeystoreGet()
 	return
 }
 
