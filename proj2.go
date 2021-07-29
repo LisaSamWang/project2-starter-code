@@ -194,51 +194,53 @@ type DataWithMACorSig struct {
 // InitUser will be called a single time to initialize a new user.
 func InitUser(username string, password string) (userdataptr *User, err error) {
 
-	cryptKey := userlib.Argon2Key([]byte(password), []byte(username), 16)
 	//deterministically get symmetric key for encryption/decryption of user struct
 	// from password w/ username salt
+	cryptKey := userlib.Argon2Key([]byte(password), []byte(username), 16)
 
+	//get MAC key deterministically from first symmetric key
+	//these first two keys are for storing user struct
 	MacKey, _ := userlib.HashKDF(cryptKey, []byte("mac for user's personal user struct"))
 	MacKey = MacKey[:16]
-	//get MAC key deterministically from first symmetric key
 
+	//create public/private encryption/decryption keys
 	var pk_encrypt_key userlib.PKEEncKey
 	var sk_decrypt_key userlib.PKEDecKey
 	pk_encrypt_key, sk_decrypt_key, _ = userlib.PKEKeyGen()
-	//create public/private encryption/decryption keys
 
+	//create public/private verify/sign keys
 	var pk_verify_key userlib.DSVerifyKey
 	var sk_sign_key userlib.DSSignKey
 	sk_sign_key, pk_verify_key, _ = userlib.DSKeyGen()
-	//create public/private verify/sign keys
 
+	//check if user already exists-maybe useless
 	_, ok := userlib.KeystoreGet(username + "_verify_key")
 	if ok {
 		return nil, errors.New(strings.ToTitle("User already exists"))
 	}
 
+	//store user's public keys in keystore
 	userlib.KeystoreSet(username+"_verify_key", pk_verify_key)
 	userlib.KeystoreSet(username+"_encrypt_key", pk_encrypt_key)
-	//store user's public keys in keystore
 
+	//set user struct data (namespace is empty)
 	var userdata User
 	userdataptr = &userdata
 	userdata.Username = username
 	userdata.Namespace = make(map[string]FileMetadata)
 	userdata.SecretSignKey = sk_sign_key
 	userdata.SecretDecryptKey = sk_decrypt_key
-	//set user struct data (namespace is empty)
 
+	//marshal ,encrypt, mac user struct
 	userStructByteArray, _ := json.Marshal(userdata)
 	encryptedThenMACedStruct := encryptThenMAC(cryptKey, MacKey, userStructByteArray)
-	//marshall,encrypt, mac user struct
 
+	//get uuid for user struct deterministically from username (where to store in Datastore)
 	usernameHashBytes := userlib.Hash([]byte(username))[:16]
 	structLocation, _ := uuid.FromBytes(usernameHashBytes)
-	//get uuid for user struct deterministically from username
 
-	userlib.DatastoreSet(structLocation, encryptedThenMACedStruct)
 	//store user struct in datastore
+	userlib.DatastoreSet(structLocation, encryptedThenMACedStruct)
 
 	return &userdata, nil
 }
@@ -247,34 +249,36 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 // https://cs161.org/assets/projects/2/docs/client_api/getuser.html
 func GetUser(username string, password string) (userdataptr *User, err error) {
 
+	//get keys same way as in InitUser (deterministic)
 	cryptKey := userlib.Argon2Key([]byte(password), []byte(username), 16)
 
 	MacKey, _ := userlib.HashKDF(cryptKey, []byte("mac for user's personal user struct"))
 	MacKey = MacKey[:16]
-	//get keys same way as in InitUser (deterministic)
 
+	//get location of user struct in datastore same way as in InitUser (deterministic)
 	usernameHashBytes := userlib.Hash([]byte(username))[:16]
 	structLocation, _ := uuid.FromBytes(usernameHashBytes)
-	//get location of user struct in datastore same way as in InitUser (deterministic)
 
+	//grab struct as byte array
 	encryptedThenMACedStruct, ok := userlib.DatastoreGet(structLocation)
 
+	//sketchy, maybe useless
 	if !ok {
 		return nil, errors.New(strings.ToTitle("User does not exist"))
 	}
 
+	//checking struct valid
 	byteArrayUserData, ok2 := checkMACandDecrypt(cryptKey, MacKey, encryptedThenMACedStruct)
 
+	//error if not
 	if !ok2 {
 		return nil, errors.New(strings.ToTitle("MAC Error: Invalid Credentials or struct compromised"))
 	}
 
-	//get struct, check MAC, decrypt
-
 	var userdata User
 
-	json.Unmarshal(byteArrayUserData, userdata)
 	//Unmarshal struct
+	json.Unmarshal(byteArrayUserData, &userdata)
 
 	userdataptr = &userdata
 
@@ -284,26 +288,27 @@ func GetUser(username string, password string) (userdataptr *User, err error) {
 // StoreFile is documented at:
 // https://cs161.org/assets/projects/2/docs/client_api/storefile.html
 func (userdata *User) StoreFile(filename string, data []byte) (err error) {
-
-	fileNameHashed := hex.EncodeToString(userlib.Hash([]byte(filename)))
+	//DNE case, needs helper
 	//key for namespace map corresponding to filename
 
+	fileNameHashed := hex.EncodeToString(userlib.Hash([]byte(filename)))
+
+	//randomly create encrypt/decrypt and MAC keys, randomly generate location for file in Datastore
 	newCryptKey := userlib.RandomBytes(16)
 	newMACKey := userlib.RandomBytes(16)
 	newFileLoc := uuid.New()
-	//randomly create encrypt/decrypt and MAC keys, randomly generate location for file in Datastore
 
-	userdata.Namespace[fileNameHashed] = FileMetadata{CryptKey: newCryptKey, MACKey: newMACKey, Location: newFileLoc}
 	//create key-value pair in namespace with file name (hashed) as key,
 	//and put new keys and location in FileMetadata struct as value
+	userdata.Namespace[fileNameHashed] = FileMetadata{CryptKey: newCryptKey, MACKey: newMACKey, Location: newFileLoc}
 
 	jsonData, _ := json.Marshal(data)
 
-	encryptedThenMACedData := encryptThenMAC(newCryptKey, newMACKey, jsonData)
 	//marshall,encrypt, mac file
+	encryptedThenMACedData := encryptThenMAC(newCryptKey, newMACKey, jsonData)
 
-	userlib.DatastoreSet(userdata.Namespace[fileNameHashed].Location, encryptedThenMACedData)
 	//store file in datastore
+	userlib.DatastoreSet(userdata.Namespace[fileNameHashed].Location, encryptedThenMACedData)
 
 	return
 }
@@ -318,20 +323,21 @@ func (userdata *User) AppendFile(filename string, data []byte) (err error) {
 // https://cs161.org/assets/projects/2/docs/client_api/loadfile.html
 func (userdata *User) LoadFile(filename string) (dataBytes []byte, err error) {
 
+	//mapkey for namespace map corresponding to filename
 	fileNameHashed := hex.EncodeToString(userlib.Hash([]byte(filename)))
-	//key for namespace map corresponding to filename
 
+	//try to find file metadata via namespace, if not there file doesn't exist
 	fileMetadataStruct, ok := userdata.Namespace[fileNameHashed]
 	if !ok {
 		return nil, errors.New(strings.ToTitle("File does not exist in namespace"))
 	}
-	//try to find file metadata via namespace, if not there file doesn't exist
 
+	//extract file's metadata from user struct
 	fileLoc := fileMetadataStruct.Location
 	fileDecryptKey := fileMetadataStruct.CryptKey
 	fileMACKey := fileMetadataStruct.MACKey
-	//extract file's metadata from user struct
 
+	//get file, check mac, decrypt
 	encryptedThenMACedFile, ok2 := userlib.DatastoreGet(fileLoc)
 	if !ok2 {
 		return nil, errors.New(strings.ToTitle("Could not load file"))
@@ -340,8 +346,8 @@ func (userdata *User) LoadFile(filename string) (dataBytes []byte, err error) {
 	if !ok3 {
 		return nil, errors.New(strings.ToTitle("MAC error: unauthorized modifications to file"))
 	}
-	//get file, check mac, decrypt
 
+	//unpack, return file to user
 	json.Unmarshal(dataJSON, &dataBytes)
 
 	return dataBytes, nil
@@ -353,24 +359,32 @@ func (userdata *User) LoadFile(filename string) (dataBytes []byte, err error) {
 func (userdata *User) ShareFile(filename string, recipient string) (
 	accessToken uuid.UUID, err error) {
 
+	//access file keys and location via namespace
 	fileNameHashed := hex.EncodeToString(userlib.Hash([]byte(filename)))
 	fileToShareMetadata, ok := userdata.Namespace[fileNameHashed]
+
+	//error if file we want to share doesnt exist
 	if !ok {
 		return uuid.New(), errors.New(strings.ToTitle("File does not exist in namespace"))
 	}
-	//error if file we want to share doesnt exist
 
-	fileToShareMetadataByteArray, _ := json.Marshal(fileToShareMetadata)
-	encryptKey, _ := userlib.KeystoreGet(recipient + "_encrypt_key")
 	//public encrypt key of recipient
+	encryptKey, _ := userlib.KeystoreGet(recipient + "_encrypt_key")
 
-	signKey := userdata.SecretSignKey
 	//private sign key of sender
+	signKey := userdata.SecretSignKey
 
+	//prepare to store invite contents
+	fileToShareMetadataByteArray, _ := json.Marshal(fileToShareMetadata)
 	encryptedAndSignedMetadata := encryptThenSign(encryptKey, signKey, fileToShareMetadataByteArray)
+
+	//random location for invite
 	inviteLoc := uuid.New()
+
+	//store invite contents in random location, return location, we're done
+	// (fine if location intercepted)
 	userlib.DatastoreSet(inviteLoc, encryptedAndSignedMetadata)
-	//store file metadata in random location encrypted and signed and we'll send location to recipient (fine if location intercepted)
+
 	return inviteLoc, nil
 }
 
@@ -378,36 +392,42 @@ func (userdata *User) ShareFile(filename string, recipient string) (
 // https://cs161.org/assets/projects/2/docs/client_api/receivefile.html
 func (userdata *User) ReceiveFile(filename string, sender string,
 	accessToken uuid.UUID) error {
-	//add to namespace map
 
+	//check if in namespace
 	fileNameHashed := hex.EncodeToString(userlib.Hash([]byte(filename)))
 	_, ok := userdata.Namespace[fileNameHashed]
+
+	//error if file already in namespace
 	if ok {
 		return errors.New(strings.ToTitle("File name already in namespace"))
 	}
-	//error if file already in namespace
 
+	//public verify key of sender
+	verifyKey, _ := userlib.KeystoreGet(sender + "_verify_key")
+
+	//private decrypt key of recipient
+	decryptKey := userdata.SecretDecryptKey
+
+	//get invite
 	encryptedAndSignedInvite, ok2 := userlib.DatastoreGet(accessToken)
 	if !ok2 {
 		return errors.New(strings.ToTitle("Invitation file not found"))
 	}
 
-	verifyKey, _ := userlib.KeystoreGet(sender + "_verify_key")
-	//public verify key of sender
-	decryptKey := userdata.SecretDecryptKey
-	//private decrypt key of recipient
-
+	//check signature, decrypt invite contents
 	inviteFileMetadataJSON, ok3 := checkSigAndDecrypt(decryptKey, verifyKey, encryptedAndSignedInvite)
+
+	//invite compromised if signature not correct
 	if !ok3 {
 		return errors.New(strings.ToTitle("Integrity of invitation compromised or invitation not from sender"))
-	} //invite compromised if signature not verified
+	}
 
 	var inviteFileMetadata FileMetadata
 
 	json.Unmarshal(inviteFileMetadataJSON, &inviteFileMetadata)
 
-	userdata.Namespace[fileNameHashed] = inviteFileMetadata
 	//load file metadata from invite into namespace with hashed filename as key
+	userdata.Namespace[fileNameHashed] = inviteFileMetadata
 
 	return nil
 }
